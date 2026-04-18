@@ -1,0 +1,55 @@
+# Project-specific instructions / logs (local only)
+CLAUDE.md
+LOGBOOK.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+!.env.example
+
+# Claude Code local state
+.claude/
+
+# Legacy reference material pulled from the VPS — not part of the harness
+vps_pull/
+
+# Generic secret patterns (belt and suspenders)
+**/secrets.json
+**/*secret*
+**/*credentials*
+**/ig_session*
+**/session.json
+**/cookies*
+**/dot_env
+**/dot_env.*
+**/*.dot_env
+**/el_api_key*
+**/*api_key*.txt
+**/*api_key*.json
+**/*_token.txt
+*.key
+*.pem
+*.pfx
+*.p12
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
