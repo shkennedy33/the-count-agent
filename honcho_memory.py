@@ -39,6 +39,9 @@ class HonchoMemory:
         self._user_peer = None
         self._session = None
 
+        self._user_peers: dict = {}
+        self._user_peer_locks: dict = {}
+
         # Stats
         self.recalls = 0
         self.stores = 0
@@ -88,7 +91,39 @@ class HonchoMemory:
             print("  [honcho] Running without vector memory — file-based memory still active")
             return False
 
-    async def recall(self, user_message: str) -> str:
+    async def get_or_create_user_peer(self, peer_id: str):
+        """Return the Honcho peer for this peer_id, creating + adding to the
+        session on first use. Async-locked per peer_id to make concurrent
+        first-messages safe.
+        """
+        if not self._ready:
+            return None
+
+        # Cache hit (no lock needed for read-only check)
+        if peer_id in self._user_peers:
+            return self._user_peers[peer_id]
+
+        # Get or create the lock for this peer_id atomically
+        lock = self._user_peer_locks.setdefault(peer_id, asyncio.Lock())
+
+        async with lock:
+            # Double-check after acquiring the lock
+            if peer_id in self._user_peers:
+                return self._user_peers[peer_id]
+
+            try:
+                from honcho.api_types import SessionPeerConfig
+                peer = await self._aio.peer(peer_id)
+                observe = SessionPeerConfig(observe_me=True, observe_others=True)
+                self._session.add_peers([(peer, observe)])
+                self._user_peers[peer_id] = peer
+                return peer
+            except Exception as e:
+                self.errors += 1
+                logger.debug("Honcho peer-create failed for %s: %s", peer_id, e)
+                return None
+
+    async def recall(self, user_message: str, user_id: str | None = None) -> str:
         """Query Honcho for context relevant to the user's message.
 
         Runs a dialectic query — Honcho's LLM reasons over the full
@@ -100,10 +135,16 @@ class HonchoMemory:
         if not self._ready:
             return ""
 
+        peer = self._user_peer
+        if user_id is not None:
+            peer = await self.get_or_create_user_peer(user_id)
+            if peer is None:
+                return ""
+
         try:
             level = self._reasoning_level(user_message)
             result = await asyncio.to_thread(
-                self._user_peer.chat,
+                peer.chat,
                 user_message,
                 target=self._ai_peer,
                 reasoning_level=level,
@@ -121,7 +162,7 @@ class HonchoMemory:
             logger.debug("Honcho recall failed: %s", e)
             return ""
 
-    async def store(self, user_message: str, assistant_response: str):
+    async def store(self, user_message: str, assistant_response: str, user_id: str | None = None):
         """Store an exchange in Honcho for future recall.
 
         Fire-and-forget safe — errors are logged but don't propagate.
@@ -129,9 +170,15 @@ class HonchoMemory:
         if not self._ready or not user_message or not assistant_response:
             return
 
+        peer = self._user_peer
+        if user_id is not None:
+            peer = await self.get_or_create_user_peer(user_id)
+            if peer is None:
+                return
+
         try:
             messages = [
-                self._user_peer.message(user_message),
+                peer.message(user_message),
                 self._ai_peer.message(assistant_response),
             ]
             await asyncio.to_thread(self._session.add_messages, messages)
