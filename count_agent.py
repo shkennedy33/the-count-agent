@@ -229,12 +229,19 @@ load_dotenv()
 def load_discord_secrets() -> dict:
     """Load Discord-specific secrets from ~/.count/dg_secrets.json.
 
-    Returns a dict with keys (any missing → None):
+    Returns:
+        - {} if the file doesn't exist or JSON is malformed.
+        - A dict with all five keys (token/guild_id values from JSON, or
+          None for any key missing from the JSON) on success.
+
+    Keys:
         discord_operator_token
         discord_operator_guild_id
         discord_operator_channel_id
         discord_training_token
         discord_training_guild_id
+
+    Downstream callers should use `.get(key)` to handle both shapes uniformly.
     """
     secrets_path = COUNT_HOME / "dg_secrets.json"
     if not secrets_path.exists():
