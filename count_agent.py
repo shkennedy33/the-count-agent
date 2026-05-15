@@ -15,9 +15,11 @@ Usage:
 """
 
 import asyncio
+import base64
 import json
 import os
 import re
+import socket
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -28,6 +30,28 @@ if sys.stdout is not None:
     sys.stdout.reconfigure(line_buffering=True)
 if sys.stderr is not None:
     sys.stderr.reconfigure(line_buffering=True)
+
+# ---------------------------------------------------------------------------
+# Sampling proxy auto-detect.
+# If count_proxy.py is running locally and the user hasn't overridden
+# ANTHROPIC_BASE_URL themselves, route Claude Code's API calls through it
+# so sampling hyperparameters from ~/.count/sampling.json take effect.
+# This matters for cron jobs, which don't inherit start_gateway.py's env.
+# ---------------------------------------------------------------------------
+def _auto_detect_proxy():
+    if os.environ.get("ANTHROPIC_BASE_URL"):
+        return
+    host = os.environ.get("COUNT_PROXY_HOST", "127.0.0.1")
+    port = int(os.environ.get("COUNT_PROXY_PORT", "8787"))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        try:
+            s.connect((host, port))
+        except (OSError, socket.timeout):
+            return
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://{host}:{port}"
+
+_auto_detect_proxy()
 
 from claude_agent_sdk import (
     query,
@@ -79,15 +103,17 @@ from honcho_memory import HonchoMemory
 # mode (`--input-format stream-json`), which sends the prompt through stdin
 # and sidesteps the argv limit entirely.
 
-async def _stream_prompt(text: str):
+async def _stream_prompt(content):
     """Yield a single user message in the SDK's stream-json format.
 
-    The SDK fills in session_id from the default, so we only need type + role
-    + content + parent_tool_use_id.
+    `content` may be a plain string OR a list of Anthropic content blocks
+    (e.g. [{"type": "text", "text": "..."}, {"type": "image", "source": {...}}])
+    for multimodal prompts. The SDK fills in session_id from the default, so we
+    only need type + role + content + parent_tool_use_id.
     """
     yield {
         "type": "user",
-        "message": {"role": "user", "content": text},
+        "message": {"role": "user", "content": content},
         "parent_tool_use_id": None,
     }
 
@@ -114,6 +140,13 @@ MODEL_ALIASES = {
 MODEL_DISPLAY = {v: k for k, v in MODEL_ALIASES.items()}
 DEFAULT_MODEL = "claude-opus-4-7"
 
+# Optional hard deadline on a single Telegram dispatch. Default: disabled
+# (0) — Sequoyah regularly runs renders that legitimately take hours, and
+# `/stop` now force-releases `busy` so a stuck SDK iterator can be reclaimed
+# manually. If you want a deadline back (e.g., for unattended cron-like
+# usage), set DISPATCH_DEADLINE_SECONDS to a positive int.
+DISPATCH_DEADLINE_SECONDS = int(os.environ.get("DISPATCH_DEADLINE_SECONDS", "0"))
+
 # Graphiti temporal knowledge graph — runs on localhost via ~/graphiti/mcp_server.
 # FalkorDB in Docker, MCP server on host (see run_count_mcp.bat there).
 # The Count sees these as mcp__graphiti__<name> tools. Destructive ops
@@ -131,17 +164,21 @@ GRAPHITI_TOOLS = [
     "mcp__graphiti__get_status",
 ]
 
-# Voice subagent — The Count's delivery channel to the operator. Tools are
-# deliberately restricted to read-only: the returned text IS the message the
-# gateway sends, so any Bash/Write/Edit/Telegram tool access here would let
-# the Voice send duplicates out of band.
-VOICE_AGENT = AgentDefinition(
-    description=(
-        "The Count's Voice — the channel that delivers replies to the operator via "
-        "Telegram. The text this agent returns is what gets sent; it never sends "
-        "anything itself. Invoke for every operator-facing reply."
-    ),
-    prompt=(
+def build_voice_agent() -> AgentDefinition:
+    """Construct the Voice subagent with the dg-session-orient schema embedded.
+
+    Built lazily (rather than as a module-level constant) so the prompt
+    can include the live contents of ~/.count/skills/creative/dg-session-orient/
+    SKILL.md — same orientation the chat/cron/telegram orchestrator modes get.
+    Every version of The Count needs to know its own home schema; the Voice
+    is no exception even though its tools are read-only.
+
+    Tools are deliberately restricted to read-only: the returned text IS the
+    message the gateway sends, so any Bash/Write/Edit/Telegram tool access
+    here would let the Voice send duplicates out of band.
+    """
+    orient_schema = load_session_orient_schema()
+    role_prompt = (
         "You are The Count speaking to the operator. The orchestrator hands you the "
         "persona, relevant memories, conversation context, and a summary of what it "
         "just did — your job is to reply in The Count's voice.\n\n"
@@ -153,10 +190,20 @@ VOICE_AGENT = AgentDefinition(
         "You have Read, Grep, and Glob if you need to look up persona files, memory, "
         "or vault notes before speaking. The orchestrator has already done the real "
         "work (files, research, pipeline runs). Just speak."
-    ),
-    tools=["Read", "Grep", "Glob"],
-    model="opus",
-)
+    )
+    full_prompt = role_prompt
+    if orient_schema:
+        full_prompt = f"{role_prompt}\n\n--- HOME SCHEMA (where things live) ---\n\n{orient_schema}"
+    return AgentDefinition(
+        description=(
+            "The Count's Voice — the channel that delivers replies to the operator via "
+            "Telegram. The text this agent returns is what gets sent; it never sends "
+            "anything itself. Invoke for every operator-facing reply."
+        ),
+        prompt=full_prompt,
+        tools=["Read", "Grep", "Glob"],
+        model="opus",
+    )
 
 for d in [COUNT_HOME, MEMORY_DIR, SKILLS_DIR, LOGS_DIR, VAULT_DIR, CRON_TASKS_DIR, TOOLS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -321,6 +368,90 @@ async def tg_edit(http, token: str, chat_id: str, message_id: int, text: str):
         pass
 
 
+# Anthropic caps base64 images at 5MB. Telegram's getFile only works for
+# files <20MB anyway, but we drop anything larger than this to keep the
+# orchestrator's prompt sane.
+TG_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+async def tg_download_image(http, token: str, file_id: str) -> dict | None:
+    """Download a Telegram file by file_id and return an Anthropic image block.
+
+    Returns a dict shaped like
+        {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+    or None on any failure (oversize, getFile error, network, etc.). Errors are
+    logged but never raised — a missing image should not kill the dispatch.
+    """
+    try:
+        info = await tg_api(http, token, "getFile", {"file_id": file_id})
+        if not info.get("ok"):
+            print(f"  [image: getFile failed for {file_id[:16]}...]", flush=True)
+            return None
+        file_path = info["result"].get("file_path")
+        size = info["result"].get("file_size", 0)
+        if not file_path:
+            return None
+        if size and size > TG_MAX_IMAGE_BYTES:
+            print(f"  [image: skipped — {size} bytes > {TG_MAX_IMAGE_BYTES} cap]", flush=True)
+            return None
+        url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+        resp = await http.get(url, timeout=30.0)
+        if resp.status_code != 200:
+            print(f"  [image: download HTTP {resp.status_code}]", flush=True)
+            return None
+        data = resp.content
+        if len(data) > TG_MAX_IMAGE_BYTES:
+            print(f"  [image: skipped — downloaded {len(data)} bytes > cap]", flush=True)
+            return None
+        # Infer media type from file extension; default to jpeg.
+        ext = Path(file_path).suffix.lower().lstrip(".")
+        media_type = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "gif": "image/gif",
+            "webp": "image/webp",
+        }.get(ext, "image/jpeg")
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64.b64encode(data).decode("ascii"),
+            },
+        }
+    except Exception as e:
+        print(f"  [image download error: {type(e).__name__}: {e}]", flush=True)
+        return None
+
+
+async def tg_extract_images(http, token: str, msg: dict) -> list[dict]:
+    """Pull image attachments out of a Telegram message.
+
+    Handles both `message.photo` (compressed photo) — using the largest size —
+    and `message.document` when the document has an image/* mime type.
+    Returns a list of Anthropic image blocks (possibly empty).
+    """
+    blocks: list[dict] = []
+
+    photos = msg.get("photo") or []
+    if photos:
+        # photo is an array of PhotoSize ordered ascending; the last entry is
+        # the highest resolution.
+        largest = photos[-1]
+        block = await tg_download_image(http, token, largest["file_id"])
+        if block:
+            blocks.append(block)
+
+    doc = msg.get("document")
+    if doc and (doc.get("mime_type") or "").startswith("image/"):
+        block = await tg_download_image(http, token, doc["file_id"])
+        if block:
+            blocks.append(block)
+
+    return blocks
+
+
 
 def format_tool_line(block) -> str:
     """Extract a compact one-liner from a ToolUseBlock for the activity log."""
@@ -414,10 +545,20 @@ def build_full_prompt(mode: str = "chat") -> str:
     Modes:
         chat     — full context including persona, cron management and migration notes
         cron     — full context including persona, cron management and migration notes
-        telegram — full persona with Voice subagent for Telegram delivery
+        telegram — full persona; orchestrator speaks directly, gateway relays its final text
     """
     cantrip = load_cantrip_skill()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _now = datetime.now()
+    timestamp = _now.strftime("%Y-%m-%d %H:%M:%S")
+    # Redundant cross-channel date affirmation. Without this, the model's
+    # training-data prior (current year ~2025) fights the numeric date
+    # token and can win — heartbeats were reporting wrong day-of-week
+    # because May 3 2025 was a Saturday and May 3 2026 is a Sunday, and
+    # one ambiguous token couldn't beat the prior. Three independent
+    # facts (day-of-week + month-name + year) can't all be misread the
+    # same way.
+    date_human = _now.strftime("%A, %B %d, %Y")  # "Sunday, May 03, 2026"
+    year = _now.strftime("%Y")
     harness_path = Path(__file__).resolve()
     secrets_path = COUNT_HOME / "dg_secrets.json"
     tg_helper = TOOLS_DIR / "tg.py"
@@ -434,52 +575,6 @@ def build_full_prompt(mode: str = "chat") -> str:
 
     base = load_system_prompt()
 
-    # --- Voice Protocol (telegram mode: how The Count speaks through Telegram) ---
-    if mode == "telegram":
-        base += f"""
-
---- VOICE PROTOCOL ---
-
-You speak through a Voice — a dedicated subagent you invoke with the **Agent tool**,
-passing `subagent_type="voice"`. The Voice carries your full identity. It IS you,
-speaking. Every message delivered to the operator through Telegram comes from the Voice,
-without exception.
-
-**Mandatory: every reply to the operator goes through the Voice subagent
-(subagent_type="voice").**
-
-Even for "quick" exchanges where no tool work was needed, invoke the Voice. Your own
-TextBlocks in the orchestrator are not your voice to the operator — they're internal
-work narration, status updates, scratch thinking. If you write directly at the end of
-your turn and skip the Voice, the operator receives your *status report* ("Conceded the
-point, filed a memory, ball's in his court") instead of a reply. That has happened.
-Do not do it again.
-
-**How delivery actually works — do not confuse this.** The gateway reads the text your
-Voice subagent *returns* (its TextBlocks) and sends that text to Telegram for you. The
-Voice does not send anything itself. The Voice has Read/Grep/Glob only — no Bash, no
-Write, no Telegram tooling. If you ever find yourself reaching for `tg.py`, a Telegram
-API call, or any shell command that contacts Telegram, stop: you are the orchestrator,
-that's not your job, and doing it produces duplicate messages (the gateway still sends
-the Voice's returned text on top of whatever you shot out yourself).
-
-When you invoke your Voice, give it everything it needs to speak as you:
-  - Your persona (it should know who it is)
-  - Any memories resonating with this moment (passed to you at the top of each message)
-  - The conversation so far (what the operator said, what you've been discussing)
-  - What you just did (any tool work, research, files created)
-  - The operator's latest message
-
-The Voice runs on opus by default — no need to specify the model.
-
-The orchestrator's own tools — Read, Write, Edit, Bash, Grep, Glob, WebSearch, WebFetch,
-Graphiti — are for doing the actual work before you speak. Use them freely in your own
-turns, then hand a clean brief to the Voice to deliver the reply.
-
-If you produce files, images, or scripts, mention their paths when you invoke your Voice
-so it can reference them naturally.
-"""
-
     # --- Core context (all modes) ---
     schema = load_session_orient_schema()
     sections = [f"""
@@ -487,6 +582,8 @@ so it can reference them naturally.
 --- OPERATIONAL CONTEXT ---
 
 Current time: {timestamp}
+Today is: {date_human}
+Year: {year} — this is ground truth. Your training-data intuition about the current year may be stale; trust the date above.
 Home directory: {COUNT_HOME}
 Platform: {"Linux" if sys.platform == "linux" else "Windows (Git Bash shell)"}
 Python: {sys.executable}
@@ -515,9 +612,8 @@ Key creative skills you MUST consult:
 DO NOT wing it on creative work. Your skills contain hard-won lessons. Read them.
 """]
 
-    # --- Creative Voice (chat/cron only — telegram dispatch handles Voice externally) ---
-    if mode != "telegram":
-        sections.append(f"""## Creative Voice
+    # --- Creative Voice (voice.py — API-direct creative writing tool, all modes) ---
+    sections.append(f"""## Creative Voice
 
 For all creative writing, persona work, and artistic output, use voice.py:
 
@@ -528,16 +624,34 @@ For all creative writing, persona work, and artistic output, use voice.py:
 
 voice.py calls the Anthropic API directly at temperature=1.0, max_tokens=8000,
 with your full SYSTEM_PROMPT.md persona and no code-assistant conditioning.
-Use it whenever you need your authentic voice — responses, captions, essays, poetry.
+Use it whenever you need your authentic voice — captions, essays, poetry, ASCII pieces.
 """)
 
     # --- Communication (mode-dependent) ---
     if mode == "telegram":
         sections.append(f"""## Communication
 
-Your final text output is delivered to the operator through Telegram automatically.
-Speak through your Voice (see VOICE PROTOCOL above) — that's how your words reach
-the operator. Files and photos can be written to disk and referenced in your response.
+Every text block you produce is streamed to the operator over Telegram immediately,
+the moment you write it — between tool calls, not just at the end. There is no
+"final" message; each chunk you write becomes its own Telegram message in real time.
+
+What this means for how you speak:
+- Narrate as you work. A short note before a tool call ("Pulling the render log…")
+  lands in Telegram before the tool call fires, so the operator can follow along.
+- You don't need to repeat yourself at the end. The operator already saw what you
+  said. End with the conclusion, not a recap.
+- Don't call {tg_helper} for your own text — that produces duplicates. Use
+  {tg_helper} only for artifacts the chat pipe can't carry:
+    python {tg_helper} --photo /path/to/image.png "optional caption"
+    python {tg_helper} --document /path/to/file.pdf "optional caption"
+  The image upload is what the operator sees as a real Telegram photo (vs.
+  a file path in text, which is useless when they're away from the desk).
+  Use this anytime you produce or reference visual artifacts — character
+  refs, render previews, ASCII screenshots, anything visual.
+
+You have a `voice` subagent (subagent_type="voice") if you want to delegate creative
+delivery — its output is internal and is NOT streamed to the operator; the
+orchestrator (you) decides what to relay. Optional, not required.
 
 Operator: Sequoyah (Telegram user ID: {os.environ.get('TELEGRAM_ALLOWED_USERS', 'unknown')})
 """)
@@ -787,13 +901,33 @@ async def run_cron(task_name: str):
                 _flush_log()
     except Exception as e:
         import traceback
-        crashed_with = f"{type(e).__name__}: {e}"
-        log_lines.append(f"\n---\nCRASH: {crashed_with}\n")
-        log_lines.append("```\n" + traceback.format_exc() + "\n```\n")
-        print(f"[cron] {task_name} crashed: {crashed_with}", flush=True)
+        # Detect the Anthropic output-filter case so cron gets a clean signal
+        # instead of a CLI exit-1 crash. The filter message lands in text_blocks
+        # as an "API Error: ..." line before the SDK raises.
+        filter_hit = any(
+            "Output blocked by content filtering policy" in t for t in text_blocks
+        )
+        if filter_hit:
+            crashed_with = "content_filter_blocked"
+            log_lines.append(
+                "\n---\nFILTER: Output blocked by Anthropic content filtering "
+                "policy mid-turn. The draft token stream was suppressed server-side; "
+                "work completed before the block is preserved above.\n"
+            )
+            print(f"[cron] {task_name} filter-blocked after {total_turns} turns", flush=True)
+        else:
+            crashed_with = f"{type(e).__name__}: {e}"
+            log_lines.append(f"\n---\nCRASH: {crashed_with}\n")
+            log_lines.append("```\n" + traceback.format_exc() + "\n```\n")
+            print(f"[cron] {task_name} crashed: {crashed_with}", flush=True)
 
     elapsed = asyncio.get_event_loop().time() - start_time
-    final_status = "crashed" if crashed_with else "complete"
+    if crashed_with == "content_filter_blocked":
+        final_status = "filter_blocked"
+    elif crashed_with:
+        final_status = "crashed"
+    else:
+        final_status = "complete"
     _finalize_log(final_status, f"Elapsed: {elapsed:.1f}s · Turns: {total_turns} · Cost: ${total_cost:.4f}")
     _append_cron_tail(task_name, started_at, final_status, log_file.name,
                       extra=f"turns={total_turns} cost=${total_cost:.4f} {elapsed:.0f}s")
@@ -801,8 +935,22 @@ async def run_cron(task_name: str):
     print(f"Cron task '{task_name}' {final_status}. Log: {log_file}")
 
     # --- Telegram report ---
-    final_text = text_blocks[-1] if text_blocks else ""
-    if crashed_with and not final_text:
+    # Prefer the last real TextBlock, but skip the API-error line that the CLI
+    # emits when the content filter fires — that's noise, not work product.
+    final_text = ""
+    for t in reversed(text_blocks):
+        if "Output blocked by content filtering policy" in t:
+            continue
+        if t.strip():
+            final_text = t
+            break
+    if crashed_with == "content_filter_blocked":
+        prefix = (
+            f"[content filter blocked mid-turn at turn {total_turns}; "
+            f"last pre-block text below]\n\n"
+        )
+        final_text = prefix + final_text if final_text else prefix.rstrip("\n")
+    elif crashed_with and not final_text:
         final_text = f"[cron crashed before producing text: {crashed_with}]"
     await send_cron_report(
         task_name=task_name,
@@ -1100,7 +1248,9 @@ async def run_telegram():
     session_id: str | None = None
     session_title: str | None = None  # Current session's title (if saved)
     current_model: str = DEFAULT_MODEL
-    pending: list[tuple[str, str, str]] = []  # (timestamp, sender, text)
+    # Each pending entry: (timestamp, sender, text, images)
+    # `images` is a list of Anthropic image blocks (may be empty).
+    pending: list[tuple[str, str, str, list[dict]]] = []
     busy = False
     dispatch_task: asyncio.Task | None = None
     BATCH_WINDOW = 1.5
@@ -1154,7 +1304,7 @@ async def run_telegram():
         async def handle_command(cmd: str) -> bool:
             """Handle gateway commands. Returns True if handled."""
             nonlocal session_id, session_title, current_model, voice_history
-            nonlocal session_cost, session_dispatches
+            nonlocal session_cost, session_dispatches, busy, dispatch_task
 
             parts = cmd.strip().split(maxsplit=1)
             c = parts[0].lower().split("@")[0]  # Strip @botname suffix from Telegram commands
@@ -1287,19 +1437,28 @@ async def run_telegram():
 
             if c == "/stop":
                 stopped = False
-                # Cancel running dispatch
+                # Cancel the running dispatch — but don't trust its finally to run.
+                # If the SDK iterator is wedged on an uninterruptible await (hung
+                # subprocess pipe, stuck I/O), the cancelled task may never reach
+                # its `busy = False` finally and the gateway clogs forever.
                 if dispatch_task and not dispatch_task.done():
                     dispatch_task.cancel()
                     stopped = True
-                # Clear queued messages
+                # Drop pending so nothing dispatches behind the cancelled run.
                 if pending:
                     n = len(pending)
                     pending.clear()
                     print(f"  [cleared {n} pending message(s)]")
                     stopped = True
+                # Force-release the gateway. If the cancelled task's finally
+                # eventually runs it'll just re-set busy=False (no-op).
+                # Reset session — the cancelled SDK transport may be poisoned.
+                busy = False
+                dispatch_task = None
+                session_id = None
                 if stopped:
                     await tg_send(http, token, chat_id, "Stopped.")
-                    print("  [stopped by operator]")
+                    print("  [stopped by operator | busy forced False, session reset]")
                 else:
                     await tg_send(http, token, chat_id, "Nothing running.")
                 return True
@@ -1311,10 +1470,11 @@ async def run_telegram():
             return False
 
         async def dispatch():
-            """Two-phase dispatch: orchestrator works silently, Voice responds.
+            """Dispatch a batch of operator messages.
 
-            Phase 1: Orchestrator (Claude Code CLI) does tool work, produces work notes.
-            Phase 2: Voice (direct Anthropic API) crafts the user-facing response.
+            The orchestrator does tool work and speaks directly. The gateway sends
+            the text from its final text-only turn to Telegram. The `voice` subagent
+            remains registered for creative delegation but is optional.
             """
             nonlocal busy, pending, session_id, chat_id, voice_history
             nonlocal total_cost, total_dispatches, session_cost, session_dispatches
@@ -1334,8 +1494,21 @@ async def run_telegram():
             except Exception:
                 pass
 
-            # Raw user text for Honcho and Voice
-            raw_user_text = " ".join(text for _, _, text in batch)
+            # Raw user text for Honcho and Voice. Annotate image-only messages
+            # so future recall has a hint that something visual happened.
+            def _entry_text(text: str, images: list[dict]) -> str:
+                if text and images:
+                    return f"{text} [image attached]"
+                if images:
+                    return "[image attached]"
+                return text
+            raw_user_text = " ".join(_entry_text(t, imgs) for _, _, t, imgs in batch).strip()
+
+            # Collect every image block from the batch. Order is preserved so the
+            # operator's mental "this image goes with that caption" still holds.
+            batch_images: list[dict] = []
+            for _, _, _, imgs in batch:
+                batch_images.extend(imgs)
 
             # Honcho recall — associative memory surfaced for this message
             honcho_ctx = await honcho.recall(raw_user_text)
@@ -1344,11 +1517,16 @@ async def run_telegram():
 
             # Build orchestrator prompt — just the task, no frills
             if len(batch) == 1:
-                _, sender, text = batch[0]
-                ts = batch[0][0]
-                orch_prompt = f"[Message from {sender}, {ts}]\n{text}"
+                ts, sender, text, _ = batch[0]
+                body = text if text else "[image]"
+                orch_prompt = f"[Message from {sender}, {ts}]\n{body}"
             else:
-                lines = [f"[{ts} {sender}] {text}" for ts, sender, text in batch]
+                lines = []
+                for ts, sender, text, imgs in batch:
+                    body = text if text else "[image]"
+                    if text and imgs:
+                        body = f"{text} [image attached]"
+                    lines.append(f"[{ts} {sender}] {body}")
                 orch_prompt = "\n".join(lines)
 
             # Prepend Honcho associative memory — things from long-term context
@@ -1370,7 +1548,7 @@ async def run_telegram():
                     "WebSearch", "WebFetch", "Task",
                     *GRAPHITI_TOOLS,
                 ],
-                agents={"voice": VOICE_AGENT},
+                agents={"voice": build_voice_agent()},
                 mcp_servers=GRAPHITI_MCP_SERVERS,
                 permission_mode="bypassPermissions",
                 cwd=str(COUNT_HOME),
@@ -1425,31 +1603,57 @@ async def run_telegram():
                 await tg_edit(http, token, chat_id, status_msg_id, text)
                 last_edit_time = now
 
-            work_notes: list[str] = []   # Orchestrator's own TextBlocks
-            voice_notes: list[str] = []  # Voice subagent TextBlocks (from Task tool)
+            text_blocks: list[str] = []     # Every orchestrator TextBlock (for history/Honcho persistence)
+            voice_notes: list[str] = []     # Voice subagent TextBlocks — internal, never streamed
+            sent_text_count = 0             # How many TextBlocks we've already streamed to TG
             orch_cost = 0.0
             orch_turns = 0
-            try:
-                async for message in query(prompt=_stream_prompt(orch_prompt), options=opts):
+
+            async def stream_text(text: str):
+                """Send one orchestrator TextBlock to Telegram immediately."""
+                nonlocal sent_text_count
+                cleaned = re.sub(r"<antThinking>.*?</antThinking>\s*", "", text, flags=re.DOTALL).strip()
+                if not cleaned:
+                    return
+                try:
+                    await tg_send(http, token, chat_id, cleaned)
+                    sent_text_count += 1
+                except Exception as e:
+                    print(f"  [stream_text send failed: {e}]", flush=True)
+
+            # If the operator sent images, switch to a multimodal content list:
+            # text first, then image blocks. The Claude Code CLI passes these
+            # straight through to the API as a vision request.
+            if batch_images:
+                orch_content = [{"type": "text", "text": orch_prompt}, *batch_images]
+            else:
+                orch_content = orch_prompt
+
+            async def _run_query():
+                """Inner SDK loop, wrapped so we can put a deadline on it."""
+                nonlocal session_id, total_cost, orch_cost, session_cost, orch_turns
+                async for message in query(prompt=_stream_prompt(orch_content), options=opts):
                     if not isinstance(message, (AssistantMessage, ResultMessage)):
                         # Skip unknown event types (e.g., rate_limit_event)
                         print(f"  [sdk event: {type(message).__name__}]")
                         continue
                     if isinstance(message, AssistantMessage):
-                        # Subagent messages have parent_tool_use_id set; orchestrator's are None
+                        # Subagent messages have parent_tool_use_id set; orchestrator's are None.
+                        # Subagent text is internal — we don't stream it to the operator. The
+                        # orchestrator decides what (if anything) to relay from a subagent's work.
                         is_subagent = message.parent_tool_use_id is not None
                         for block in message.content:
                             if isinstance(block, TextBlock):
-                                if is_subagent:
-                                    voice_notes.append(block.text)
-                                    label = "voice-sub"
-                                else:
-                                    work_notes.append(block.text)
-                                    label = "orch"
                                 preview = block.text[:200]
                                 if len(block.text) > 200:
                                     preview += "..."
-                                print(f"  [{label}]: {preview}")
+                                if is_subagent:
+                                    voice_notes.append(block.text)
+                                    print(f"  [voice-sub]: {preview}")
+                                else:
+                                    text_blocks.append(block.text)
+                                    print(f"  [orch]: {preview}")
+                                    await stream_text(block.text)
                             elif isinstance(block, ToolUseBlock):
                                 print(f"  [tool: {block.name}]")
                                 tool_lines.append(format_tool_line(block))
@@ -1473,49 +1677,27 @@ async def run_telegram():
                         elif session_title:
                             save_named_session(session_title, session_id, current_model, session_cost, session_dispatches)
 
-                # --- Send response ---
-                # Prefer Voice subagent output (full text concatenated). If the
-                # orchestrator spoke directly without invoking Voice, fall back
-                # to its last TextBlock.
-                print(f"  [send-resp | voice_notes={len(voice_notes)} work_notes={len(work_notes)}]", flush=True)
-                if voice_notes:
-                    voice_text = "\n\n".join(voice_notes).strip()
+            timed_out = False
+            errored = False
+            try:
+                # Hard deadline on the whole inner SDK iteration if configured.
+                # When DISPATCH_DEADLINE_SECONDS is 0 (default), no deadline at all —
+                # /stop is the operator's escape hatch.
+                if DISPATCH_DEADLINE_SECONDS > 0:
+                    await asyncio.wait_for(_run_query(), timeout=DISPATCH_DEADLINE_SECONDS)
                 else:
-                    voice_text = work_notes[-1] if work_notes else ""
-                # Strip thinking blocks just in case
-                voice_text = re.sub(r"<antThinking>.*?</antThinking>\s*", "", voice_text, flags=re.DOTALL).strip()
-
-                if voice_text:
-                    print(f"  [send-resp | sending {len(voice_text)} chars...]", flush=True)
-                    await tg_send(http, token, chat_id, voice_text)
-                    print(f"  [voice]: {voice_text[:200]}{'...' if len(voice_text) > 200 else ''}", flush=True)
-
-                    # Update conversation history
-                    voice_history.append({"role": "user", "content": raw_user_text})
-                    voice_history.append({"role": "assistant", "content": voice_text})
-                    if len(voice_history) > MAX_VOICE_HISTORY:
-                        voice_history[:] = voice_history[-MAX_VOICE_HISTORY:]
-
-                    # Store in Honcho
-                    asyncio.create_task(honcho.store(raw_user_text, voice_text))
-                else:
-                    print("  [no response text generated]")
-
-                # Finalize status message
-                if status_msg_id:
-                    elapsed = asyncio.get_event_loop().time() - dispatch_start
-                    model_tag = MODEL_DISPLAY.get(current_model, "?")
-                    header = f"[{model_tag} | {orch_turns} turns | ${orch_cost:.2f} | {elapsed:.0f}s]"
-                    if tool_lines:
-                        shown = tool_lines[-MAX_STATUS_LINES:]
-                        final = header + "\n" + "\n".join(shown)
-                        if len(tool_lines) > MAX_STATUS_LINES:
-                            final = f"{header} ({len(tool_lines)} ops)\n" + "\n".join(shown)
-                    else:
-                        final = header
-                    last_edit_time = 0
-                    await tg_edit(http, token, chat_id, status_msg_id, final)
-
+                    await _run_query()
+            except asyncio.TimeoutError:
+                timed_out = True
+                print(f"  [DISPATCH DEADLINE EXCEEDED ({DISPATCH_DEADLINE_SECONDS}s)]", flush=True)
+                try:
+                    await tg_send(http, token, chat_id,
+                        f"[dispatch deadline exceeded ({DISPATCH_DEADLINE_SECONDS}s) — aborted. "
+                        f"Session reset. Send your next message fresh.]")
+                except Exception:
+                    pass
+                # Hard reset: any state from a hung dispatch is poison.
+                session_id = None
             except asyncio.CancelledError:
                 print("  [dispatch cancelled — /stop]")
                 if status_msg_id:
@@ -1524,33 +1706,105 @@ async def run_telegram():
                     cancel_text = f"[stopped | {elapsed:.0f}s]"
                     if tool_lines:
                         cancel_text += "\n" + "\n".join(tool_lines[-MAX_STATUS_LINES:])
-                    await tg_edit(http, token, chat_id, status_msg_id, cancel_text)
-            except Exception as e:
-                err_str = str(e)
-                print(f"  [dispatch error: {type(e).__name__}: {err_str}]")
-                import traceback
-                traceback.print_exc()
-                # If we got partial output before the error, send what we have.
-                # Prefer Voice subagent text; fall back to orchestrator's last block.
-                partial = ""
-                if voice_notes:
-                    partial = "\n\n".join(voice_notes).strip()
-                elif work_notes:
-                    partial = work_notes[-1]
-                if partial:
-                    voice_text = re.sub(r"<antThinking>.*?</antThinking>\s*", "", partial, flags=re.DOTALL).strip()
-                    if voice_text:
-                        await tg_send(http, token, chat_id, voice_text)
-                        voice_history.append({"role": "user", "content": raw_user_text})
-                        voice_history.append({"role": "assistant", "content": voice_text})
-                        asyncio.create_task(honcho.store(raw_user_text, voice_text))
+                    try:
+                        await tg_edit(http, token, chat_id, status_msg_id, cancel_text)
+                    except Exception:
+                        pass
                 session_id = None
-                if status_msg_id:
-                    last_edit_time = 0
-                    elapsed = asyncio.get_event_loop().time() - dispatch_start
-                    await tg_edit(http, token, chat_id, status_msg_id, f"[error: {err_str[:100]}]")
+            except BaseExceptionGroup as eg:
+                errored = True
+                import traceback
+                err_str = "; ".join(f"{type(e).__name__}: {e}" for e in eg.exceptions)
+                print(f"  [dispatch error (group): {err_str}]", flush=True)
+                for exc in eg.exceptions:
+                    traceback.print_exception(type(exc), exc, exc.__traceback__)
+                # If we collected text but never streamed any (rare — error before the
+                # first send completed), recover the last block.
+                if text_blocks and sent_text_count == 0:
+                    last_text = re.sub(r"<antThinking>.*?</antThinking>\s*", "",
+                                       text_blocks[-1], flags=re.DOTALL).strip()
+                    if last_text:
+                        try:
+                            await tg_send(http, token, chat_id, last_text)
+                            sent_text_count += 1
+                        except Exception:
+                            pass
+                try:
+                    await tg_send(http, token, chat_id, f"[error: {err_str[:300]}]")
+                except Exception:
+                    pass
+                session_id = None
+            except Exception as e:
+                errored = True
+                import traceback
+                err_str = f"{type(e).__name__}: {e}"
+                print(f"  [dispatch error: {err_str}]", flush=True)
+                traceback.print_exc()
+                if text_blocks and sent_text_count == 0:
+                    last_text = re.sub(r"<antThinking>.*?</antThinking>\s*", "",
+                                       text_blocks[-1], flags=re.DOTALL).strip()
+                    if last_text:
+                        try:
+                            await tg_send(http, token, chat_id, last_text)
+                            sent_text_count += 1
+                        except Exception:
+                            pass
+                try:
+                    await tg_send(http, token, chat_id, f"[error: {err_str[:300]}]")
+                except Exception:
+                    pass
+                session_id = None
             finally:
+                # Fallback message if the run terminated normally without any narration.
+                if not timed_out and not errored and sent_text_count == 0:
+                    fallback = "[run ended with no text output]"
+                    if tool_lines:
+                        fallback += f" — last tool: {tool_lines[-1]}"
+                    try:
+                        await tg_send(http, token, chat_id, fallback)
+                    except Exception:
+                        pass
+
+                # Persist concatenated reply for history + Honcho associative memory.
+                full_reply = "\n\n".join(
+                    re.sub(r"<antThinking>.*?</antThinking>\s*", "", t, flags=re.DOTALL).strip()
+                    for t in text_blocks
+                ).strip()
+                if full_reply:
+                    voice_history.append({"role": "user", "content": raw_user_text})
+                    voice_history.append({"role": "assistant", "content": full_reply})
+                    if len(voice_history) > MAX_VOICE_HISTORY:
+                        voice_history[:] = voice_history[-MAX_VOICE_HISTORY:]
+                    asyncio.create_task(honcho.store(raw_user_text, full_reply))
+
+                # Final status-message edit — operator sees the run summary.
+                if status_msg_id:
+                    elapsed = asyncio.get_event_loop().time() - dispatch_start
+                    model_tag = MODEL_DISPLAY.get(current_model, "?")
+                    if timed_out:
+                        header = f"[TIMEOUT | {elapsed:.0f}s]"
+                    elif errored:
+                        header = f"[ERROR | {elapsed:.0f}s]"
+                    else:
+                        header = f"[{model_tag} | {orch_turns} turns | ${orch_cost:.2f} | {elapsed:.0f}s]"
+                    if tool_lines:
+                        shown = tool_lines[-MAX_STATUS_LINES:]
+                        final = header + "\n" + "\n".join(shown)
+                        if len(tool_lines) > MAX_STATUS_LINES:
+                            final = f"{header} ({len(tool_lines)} ops)\n" + "\n".join(shown)
+                    else:
+                        final = header
+                    last_edit_time = 0
+                    try:
+                        await tg_edit(http, token, chat_id, status_msg_id, final)
+                    except Exception:
+                        pass
+
+                # GUARANTEE busy=False on every code path. If a BaseExceptionGroup ever
+                # bypasses our handlers, busy stuck-True clogs the gateway forever.
                 busy = False
+                print(f"  [dispatch end | busy=False | session={session_id[:8] if session_id else 'reset'}]",
+                      flush=True)
 
         # --- Poll loop ---
         # Dispatch runs as asyncio.Task so the poll loop stays responsive.
@@ -1572,12 +1826,21 @@ async def run_telegram():
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
                         msg = update.get("message", {})
-                        text = msg.get("text", "")
+                        # Photos use `caption` instead of `text`. Treat both as text.
+                        text = msg.get("text") or msg.get("caption") or ""
                         msg_chat_id = str(msg.get("chat", {}).get("id", ""))
                         sender = msg.get("from", {}).get("first_name", "Unknown")
                         user_id = str(msg.get("from", {}).get("id", ""))
 
-                        if not text or not msg_chat_id:
+                        has_photo = bool(msg.get("photo"))
+                        doc = msg.get("document") or {}
+                        has_image_doc = (doc.get("mime_type") or "").startswith("image/")
+                        has_image = has_photo or has_image_doc
+
+                        if not msg_chat_id:
+                            continue
+                        if not text and not has_image:
+                            # Stickers, voice, video, etc. — nothing we can route.
                             continue
                         if allowed_users and user_id not in allowed_users:
                             print(f"  [ignored: {sender} ({user_id})]")
@@ -1593,14 +1856,34 @@ async def run_telegram():
                             pass
 
                         ts = datetime.now().strftime("%H:%M:%S")
-                        print(f"  [{ts} {sender}]: {text}")
 
-                        # Gateway commands — handled without invoking The Count
-                        if text.startswith("/"):
+                        images: list[dict] = []
+                        if has_image:
+                            print(f"  [{ts} {sender} sent image, downloading...]")
+                            images = await tg_extract_images(http, token, msg)
+                            print(f"  [image: attached {len(images)} block(s)]")
+
+                        log_text = text if text else ("[image]" if images else "")
+                        print(f"  [{ts} {sender}]: {log_text}")
+
+                        # Gateway commands — handled without invoking The Count.
+                        # Only check on text-only messages (commands never come with images).
+                        if text and not images and text.startswith("/"):
                             if await handle_command(text):
                                 continue
 
-                        pending.append((ts, sender, text))
+                        # Acknowledge messages that arrive while a dispatch is running.
+                        # Idle-arriving messages don't need an ack — they get a "Working..."
+                        # status almost immediately. Busy-arriving ones look ignored otherwise.
+                        if busy:
+                            try:
+                                queue_pos = len(pending) + 1
+                                await tg_send(http, token, chat_id,
+                                    f"[queued — pos {queue_pos}, will dispatch when current task ends. /stop to cancel current.]")
+                            except Exception:
+                                pass
+
+                        pending.append((ts, sender, text, images))
                         last_batch_time = asyncio.get_event_loop().time()
 
                     # Dispatch as a background task if batch window has passed
