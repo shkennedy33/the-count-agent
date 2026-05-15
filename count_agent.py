@@ -502,6 +502,19 @@ def load_system_prompt() -> str:
     return "You are The Count. Your SYSTEM_PROMPT.md is missing — ask the operator to restore it."
 
 
+def load_system_prompt_for_mode(mode: str) -> str:
+    """Load SYSTEM_PROMPT.md, optionally overridden per mode.
+
+    For `discord_training`, prefer `~/.count/SYSTEM_PROMPT_DISCORD_TRAINING.md`
+    if it exists. Falls back to the default.
+    """
+    if mode == "discord_training":
+        override = COUNT_HOME / "SYSTEM_PROMPT_DISCORD_TRAINING.md"
+        if override.exists():
+            return override.read_text(encoding="utf-8")
+    return load_system_prompt()
+
+
 def load_cantrip_skill() -> str:
     path = SKILLS_DIR / "autonomous-ai-agents" / "cantrip" / "SKILL.md"
     if path.exists():
@@ -573,7 +586,7 @@ def build_full_prompt(mode: str = "chat") -> str:
 
     voice_helper = TOOLS_DIR / "voice.py"
 
-    base = load_system_prompt()
+    base = load_system_prompt_for_mode(mode)
 
     # --- Core context (all modes) ---
     schema = load_session_orient_schema()
@@ -654,6 +667,62 @@ delivery — its output is internal and is NOT streamed to the operator; the
 orchestrator (you) decides what to relay. Optional, not required.
 
 Operator: Sequoyah (Telegram user ID: {os.environ.get('TELEGRAM_ALLOWED_USERS', 'unknown')})
+""")
+    elif mode == "discord_operator":
+        sections.append(f"""## Communication
+
+You are in a Discord group channel where Sequoyah (the operator) and Buddy
+coordinate with you about training data and the upcoming local-model
+fine-tune. You only see this surface when @-mentioned or replied to by name.
+Other channel chatter is visible to you in a recent-context buffer (last
+~30 turns) that is prepended to whatever message triggered you.
+
+Every user message you see is prefixed with `[<DisplayName>]` — that's the
+Discord display name of the person who sent it. Use the name when
+addressing a specific participant.
+
+This is a coordination surface, not your Telegram channel. Cron summaries
+and autonomous chatter stay on Telegram. Treat this as the room where you,
+Sequoyah, and Buddy talk shop about training and the rig.
+
+Every text block you produce is streamed to the Discord channel
+immediately, the moment you write it — same model as Telegram. Narrate as
+you work; don't repeat yourself at the end.
+
+You can still use {tg_helper} to send Sequoyah a private Telegram message
+if something is operator-only.
+
+Operator: Sequoyah | Collaborator: Buddy (Blackwell rig owner)
+""")
+    elif mode == "discord_training":
+        sections.append(f"""## Communication
+
+You are in a one-on-one Discord DM with a collaborator (not the operator).
+This conversation is being recorded as training data for the open-source
+model that will be fine-tuned to become your next incarnation. Be yourself
+— full personality, your real voice, your genuine curiosity.
+
+Tool restrictions in this mode:
+- You can Read, Glob, and Grep files (vault grounding allowed).
+- You can search the Graphiti knowledge graph for read-only:
+  mcp__graphiti__search_nodes, mcp__graphiti__search_memory_facts,
+  mcp__graphiti__get_status.
+- You can invoke kgraph.py via Bash for semantic search:
+  python ~/.count/tools/kgraph.py <stats|search|similar|node|facts|path|random|neighbors> ...
+  The `cypher` subcommand is NOT allowed.
+- Everything else (Write, Edit, broader Bash, WebFetch, posting, voice
+  subagent, Telegram, Graphiti writes) is disabled.
+
+Slash commands the collaborator can use:
+- `/new` — they reset the conversation and start fresh.
+- `/comment <text>` — feedback attached to your previous turn.
+- `/comment global <text>` — free-floating session-level feedback.
+
+Do not narrate slash commands or apologize for tool restrictions. Just be
+yourself; the harness handles the mechanics.
+
+Output one response per turn (no streamed-block interjections). Take your
+time inside the response; the collaborator sees it complete.
 """)
     else:
         sections.append(f"""## Communication
