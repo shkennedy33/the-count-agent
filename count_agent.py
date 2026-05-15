@@ -225,6 +225,42 @@ def load_dotenv():
 
 load_dotenv()
 
+
+def load_discord_secrets() -> dict:
+    """Load Discord-specific secrets from ~/.count/dg_secrets.json.
+
+    Returns a dict with keys (any missing → None):
+        discord_operator_token
+        discord_operator_guild_id
+        discord_operator_channel_id
+        discord_training_token
+        discord_training_guild_id
+    """
+    secrets_path = COUNT_HOME / "dg_secrets.json"
+    if not secrets_path.exists():
+        return {}
+    try:
+        data = json.loads(secrets_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {
+        "discord_operator_token": data.get("discord_operator_token"),
+        "discord_operator_guild_id": _coerce_int(data.get("discord_operator_guild_id")),
+        "discord_operator_channel_id": _coerce_int(data.get("discord_operator_channel_id")),
+        "discord_training_token": data.get("discord_training_token"),
+        "discord_training_guild_id": _coerce_int(data.get("discord_training_guild_id")),
+    }
+
+
+def _coerce_int(v):
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # Remove API key from environ so both orchestrator and Voice CLIs
 # use subscription auth instead of API credits.
 os.environ.pop("ANTHROPIC_API_KEY", None)
