@@ -24,6 +24,7 @@ Env overrides:
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -43,6 +44,80 @@ HOP_BY_HOP = {
 }
 
 SAMPLING_KEYS = ("temperature", "top_p", "top_k")
+
+# ---- Request capture log ---------------------------------------------------
+# Set COUNT_PROXY_LOG=0 to disable. Default on. One JSONL line per request.
+# Purpose: capture the wire-level shape of caller traffic (Agent SDK now,
+# claude -p / Claude Code later) so we can diff what identifies one from the
+# other — header? body field? endpoint? auth shape? The proxy already sees
+# the whole request; this just persists it.
+LOG_FILE = Path(
+    os.environ.get(
+        "COUNT_PROXY_LOG_FILE",
+        str(Path.home() / ".count" / "logs" / "proxy_calls.jsonl"),
+    )
+)
+LOG_ENABLED = os.environ.get("COUNT_PROXY_LOG", "1") != "0"
+
+# Headers whose values are secrets — redact to type+shape, keep prefix/suffix
+# so we can still distinguish "Bearer ..." from "sk-ant-..." token families.
+SECRET_HEADERS = {"authorization", "x-api-key", "proxy-authorization"}
+
+
+def _redact_secret(value: str) -> str:
+    """Reveal token family + length + first6/last4 only. Never the middle."""
+    if not value:
+        return ""
+    n = len(value)
+    head = value[:6]
+    tail = value[-4:] if n > 10 else ""
+    return f"{head}…{tail} (len={n})"
+
+
+def _redact_headers(items) -> dict:
+    out = {}
+    for k, v in items:
+        if k.lower() in SECRET_HEADERS:
+            out[k] = _redact_secret(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _parse_body(body_bytes: bytes):
+    """Return parsed JSON if possible, else a {raw_len, raw_preview} summary."""
+    if not body_bytes:
+        return None
+    try:
+        return json.loads(body_bytes)
+    except (ValueError, UnicodeDecodeError):
+        return {
+            "raw_len": len(body_bytes),
+            "raw_preview_hex": body_bytes[:64].hex(),
+        }
+
+
+def log_request(request: web.Request, body_bytes: bytes) -> None:
+    """Append one JSONL event describing this request. Never raises."""
+    if not LOG_ENABLED:
+        return
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "method": request.method,
+            "path": request.path,
+            "query": dict(request.rel_url.query),
+            "headers": _redact_headers(request.headers.items()),
+            "body": _parse_body(body_bytes),
+            "body_bytes": len(body_bytes),
+            "remote": request.remote,
+        }
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str))
+            f.write("\n")
+    except Exception as e:  # noqa: BLE001 — logging must never break proxying
+        print(f"[count-proxy] log error: {e}", file=sys.stderr)
 
 
 def load_sampling() -> dict:
@@ -72,6 +147,10 @@ def inject_sampling(body_bytes: bytes) -> bytes:
 async def proxy(request: web.Request) -> web.StreamResponse:
     upstream_url = f"{UPSTREAM}{request.rel_url.path_qs}"
     body = await request.read()
+
+    # Capture the request as the caller sent it — before any mutation we do.
+    # Used for the Agent SDK ↔ Claude Code discriminator hunt (see header comment).
+    log_request(request, body)
 
     # Only /v1/messages POSTs get sampling injected. /v1/messages/count_tokens
     # and everything else passes through untouched.

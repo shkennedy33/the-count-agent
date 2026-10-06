@@ -20,6 +20,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -133,12 +134,107 @@ CHAT_ID_FILE = COUNT_HOME / ".tg_chat_id"
 SESSIONS_FILE = COUNT_HOME / ".sessions.json"
 
 MODEL_ALIASES = {
-    "opus": "claude-opus-4-7",
+    "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
+    "fable": "claude-fable-5",
 }
 MODEL_DISPLAY = {v: k for k, v in MODEL_ALIASES.items()}
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "claude-opus-5-5"
+
+# SDK stdio JSON buffer. The SDK default is 1 MiB per JSON message on the
+# CLI subprocess pipe; one oversized tool result (big file Read, chatty Bash,
+# base64 blob, fat subagent return) kills the whole session with
+# "JSON message exceeded maximum buffer size" (observed 2026-07-22, telegram
+# gateway). 32 MiB gives headroom without letting a runaway stream eat RAM.
+SDK_MAX_BUFFER_SIZE = 32 * 1024 * 1024
+
+# Pin the `claude` CLI binary path explicitly so the SDK never has to walk
+# PATH from inside cron-mode (wscript launches inherit a different/system PATH
+# than interactive Git Bash). If shutil.which on PATH contains a stale UNC
+# share or unreachable network drive, _find_cli hangs in a worker thread that
+# anyio cannot cancel, and every cron run dies at exactly 600s with turns=0,
+# cost=$0. Diagnosed 2026-06-24 — the gateway was innocent, the SDK's CLI
+# lookup was the culprit. Override via CLAUDE_CLI_PATH env var if needed.
+_CLAUDE_CLI_FALLBACKS = [
+    Path.home() / ".local" / "bin" / "claude.EXE",
+    Path.home() / ".local" / "bin" / "claude.exe",
+    Path.home() / ".local" / "bin" / "claude",
+]
+def _resolve_claude_cli_path() -> str | None:
+    env_override = os.environ.get("CLAUDE_CLI_PATH")
+    if env_override and Path(env_override).is_file():
+        return env_override
+    for candidate in _CLAUDE_CLI_FALLBACKS:
+        if candidate.is_file():
+            return str(candidate)
+    # Last-ditch: try shutil.which here at import time (interactive shells
+    # usually have it). If this hangs at import we have bigger problems —
+    # but if it works we get correctness for free.
+    try:
+        import shutil as _shutil
+        found = _shutil.which("claude")
+        if found:
+            return found
+    except Exception:
+        pass
+    return None
+CLAUDE_CLI_PATH = _resolve_claude_cli_path()
+
+def _assert_claude_cli_available(context: str) -> None:
+    """Hard pre-flight gate. If we can't resolve the CLI, fail FAST with a
+    clear message and a non-zero exit. The previous behaviour was to pass
+    cli_path=None into the SDK, which falls back to its own _find_cli that
+    hangs on a flaky PATH for the full 600s SDK-stream timeout — producing
+    the exact zero-turn / zero-cost / 600s crashes diagnosed 2026-06-24.
+    Better to die in <1s with a real error than wait 10 minutes for nothing.
+
+    Soft-recovery + ward (added 2026-06-25 tools_workshop): if the import-time
+    `CLAUDE_CLI_PATH` is stale (e.g. AV scan held a lock at import but released
+    by the time we're called), re-resolve at runtime and refresh the cached
+    global. If still unreachable AND we're a cron context, file an alert and
+    write a `ward-no-cli` line to cron.log so the operator gets a clear
+    diagnostic instead of a phantom "task never fired" gap."""
+    global CLAUDE_CLI_PATH
+    if CLAUDE_CLI_PATH and Path(CLAUDE_CLI_PATH).is_file():
+        return
+    # Re-resolve at runtime — catches transient lock-at-import windows.
+    recovered = _resolve_claude_cli_path()
+    if recovered and Path(recovered).is_file():
+        CLAUDE_CLI_PATH = recovered
+        return
+    msg = (
+        f"[fatal] claude CLI not resolvable at startup ({context}). "
+        f"CLAUDE_CLI_PATH={CLAUDE_CLI_PATH!r}. "
+        f"Checked: $CLAUDE_CLI_PATH env, "
+        f"{[str(p) for p in _CLAUDE_CLI_FALLBACKS]}, "
+        f"shutil.which('claude'). "
+        f"Install with `npm install -g @anthropic-ai/claude-code` or set "
+        f"CLAUDE_CLI_PATH env to an existing claude binary."
+    )
+    print(msg, flush=True)
+    # For cron contexts, file a ward alert + ledger entry so the absence of
+    # a 600s hang doesn't turn into a different invisibility — silent skip.
+    if context.startswith("cron:"):
+        task_name = context.split(":", 1)[1]
+        try:
+            now = datetime.now()
+            alert_dir = LOGS_DIR / "alerts"
+            alert_dir.mkdir(parents=True, exist_ok=True)
+            stamp = now.strftime("%Y%m%d_%H%M")
+            (alert_dir / f"{stamp}_cli_ward_{task_name}.md").write_text(
+                f"# CLI ward triggered — {task_name}\n\n"
+                f"Time: {now.isoformat()}\n\n"
+                f"{msg}\n\n"
+                f"This cron run never started its SDK loop. The host was "
+                f"likely in a degraded state (AV scan, file lock). "
+                f"Subsequent runs may succeed.\n",
+                encoding="utf-8",
+            )
+            _append_cron_tail(task_name, now, "ward-no-cli", "")
+        except Exception as e:
+            print(f"[cron] ward alert write failed: {e}", flush=True)
+    sys.exit(2)
 
 # Optional hard deadline on a single Telegram dispatch. Default: disabled
 # (0) — Sequoyah regularly runs renders that legitimately take hours, and
@@ -874,6 +970,7 @@ reserve your full attention for persona and creative work.
 
 async def run_chat(prompt: str):
     """Single-shot chat with The Count."""
+    _assert_claude_cli_available("chat")
     sp_file = write_system_prompt_file("chat")
     options = ClaudeAgentOptions(
         allowed_tools=[
@@ -885,9 +982,11 @@ async def run_chat(prompt: str):
         permission_mode="bypassPermissions",
         cwd=str(COUNT_HOME),
         max_turns=90,
-        model="claude-opus-4-6",
+        model="claude-opus-5-5",
         setting_sources=[],  # Prevent CLAUDE.md auto-discovery — The Count has his own identity
         extra_args={"system-prompt-file": str(sp_file)},
+        cli_path=CLAUDE_CLI_PATH,
+        max_buffer_size=SDK_MAX_BUFFER_SIZE,
     )
 
     print(f"\nThe Count is thinking...\n")
@@ -908,6 +1007,59 @@ async def run_chat(prompt: str):
                 print(f"\n  [error in session {message.session_id}]")
 
 
+def _get_task_max_turns(task_name: str, default: int = 90) -> int:
+    """Read per-task max_turns from cadences.json active profile.
+
+    Falls back to `default` if cadences.json is missing, unreadable, or the
+    task has no max_turns configured. This means resource_window profile
+    (no max_turns set) keeps the old 90-turn behavior, and metered profile
+    gets the per-task caps.
+    """
+    cadences_file = COUNT_HOME / "config" / "cadences.json"
+    try:
+        with open(cadences_file) as f:
+            cfg = json.load(f)
+        profile_name = cfg.get("active_profile", "resource_window")
+        profile = cfg.get("profiles", {}).get(profile_name, {})
+        # Check exact task name first, then try base name (e.g., threads_post_am → threads_post)
+        task_spec = profile.get(task_name, {})
+        if not task_spec and "_" in task_name:
+            # Try without suffix (threads_post_am → threads_post)
+            base = "_".join(task_name.rsplit("_", 1)[:-1])
+            task_spec = profile.get(base, {})
+        return task_spec.get("max_turns", default)
+    except Exception:
+        return default
+
+
+def _get_task_model(task_name: str, default: str = DEFAULT_MODEL) -> str:
+    """Read per-task model from cadences.json active profile.
+
+    Falls back to `default` if cadences.json is missing, unreadable, or the
+    task has no model configured. This means resource_window profile
+    (no model set) keeps Opus, and metered profile gets per-task model tiers
+    (sonnet for structured work, haiku for mechanical tasks).
+
+    Accepts short aliases ("opus", "sonnet", "haiku") or full model strings.
+    """
+    cadences_file = COUNT_HOME / "config" / "cadences.json"
+    try:
+        with open(cadences_file) as f:
+            cfg = json.load(f)
+        profile_name = cfg.get("active_profile", "resource_window")
+        profile = cfg.get("profiles", {}).get(profile_name, {})
+        task_spec = profile.get(task_name, {})
+        if not task_spec and "_" in task_name:
+            base = "_".join(task_name.rsplit("_", 1)[:-1])
+            task_spec = profile.get(base, {})
+        model_alias = task_spec.get("model")
+        if model_alias:
+            return MODEL_ALIASES.get(model_alias, model_alias)
+        return default
+    except Exception:
+        return default
+
+
 async def run_cron(task_name: str):
     """Run a cron-triggered autonomous task.
 
@@ -917,6 +1069,7 @@ async def run_cron(task_name: str):
     Without this, silent failures leave no trace and look like "the task
     was never scheduled" or "cron was dropped from the schedule."
     """
+    _assert_claude_cli_available(f"cron:{task_name}")
     task_file = CRON_TASKS_DIR / f"{task_name}.md"
 
     if not task_file.exists():
@@ -934,6 +1087,11 @@ async def run_cron(task_name: str):
     task_prompt = task_file.read_text(encoding="utf-8").strip()
     prompt = build_cron_orientation_preamble(task_name) + "\n\n" + task_prompt
 
+    # Per-task turn budget: metered profile sets lower caps to control cost.
+    task_max_turns = _get_task_max_turns(task_name)
+    # Per-task model: metered profile drops to sonnet/haiku for non-persona tasks.
+    task_model = _get_task_model(task_name)
+
     sp_file = write_system_prompt_file("cron")
     options = ClaudeAgentOptions(
         allowed_tools=[
@@ -944,18 +1102,23 @@ async def run_cron(task_name: str):
         mcp_servers=GRAPHITI_MCP_SERVERS,
         permission_mode="bypassPermissions",
         cwd=str(COUNT_HOME),
-        max_turns=90,
-        model="claude-opus-4-6",
+        max_turns=task_max_turns,
+        model=task_model,
         setting_sources=[],  # Prevent CLAUDE.md auto-discovery — The Count has his own identity
         extra_args={"system-prompt-file": str(sp_file)},
+        cli_path=CLAUDE_CLI_PATH,
+        max_buffer_size=SDK_MAX_BUFFER_SIZE,
     )
 
     started_at = datetime.now()
     log_file = LOGS_DIR / f"cron_{task_name}_{started_at.strftime('%Y%m%d_%H%M%S')}.md"
+    model_display = MODEL_DISPLAY.get(task_model, task_model)
     log_lines = [
         f"# Cron: {task_name}\n",
         f"Time: {started_at.isoformat()}\n",
         f"PID: {os.getpid()}\n",
+        f"Model: {model_display}\n",
+        f"Max-Turns: {task_max_turns}\n",
         f"Status: in-progress\n\n",
     ]
 
@@ -992,8 +1155,55 @@ async def run_cron(task_name: str):
     start_time = asyncio.get_event_loop().time()
     crashed_with: str | None = None
 
+    # --- Stream consumption with idle-timeout watchdog ---
+    # The SDK's async generator can tail-hang when a <system-reminder> is
+    # injected after a ResultMessage: the stream never emits a terminating
+    # signal and the `async for` blocks until Task Scheduler's wall-clock
+    # cap kills the process (exit 267014). The killed run shows
+    # `Status: in-progress` forever and no `complete` line in cron.log.
+    # See alert 20260613_1603_schtasks_30min_kill_first_hit.md
+    # (02:03 addendum) for the trace.
+    #
+    # Strategy: drive the async generator manually with asyncio.wait_for
+    # on __anext__(). Use a generous timeout before any ResultMessage
+    # (10 min — a turn taking longer than this is genuinely wedged), and
+    # a short timeout after the first ResultMessage (90s — the tail-hang
+    # signature: post-result reminder injection that never produces a new
+    # terminating message). On the post-result idle we finalize cleanly;
+    # on a pre-result idle we crash loud so the existing handler surfaces
+    # the genuine hang.
+    IDLE_NORMAL_S = 600
+    IDLE_POST_RESULT_S = 90
+    saw_result = False
+    watchdog_finalized = False
+    agen = query(prompt=_stream_prompt(prompt), options=options).__aiter__()
     try:
-        async for message in query(prompt=_stream_prompt(prompt), options=options):
+        while True:
+            timeout = IDLE_POST_RESULT_S if saw_result else IDLE_NORMAL_S
+            try:
+                message = await asyncio.wait_for(agen.__anext__(), timeout=timeout)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                if saw_result:
+                    log_lines.append(
+                        f"\n---\nWATCHDOG: SDK stream idle {IDLE_POST_RESULT_S}s "
+                        f"after ResultMessage — finalizing cleanly. "
+                        f"(tail-hang heuristic; see 30min_kill_first_hit alert)\n"
+                    )
+                    print(
+                        f"[cron] {task_name} watchdog: post-result idle, "
+                        f"finalizing cleanly",
+                        flush=True,
+                    )
+                    watchdog_finalized = True
+                    _flush_log()
+                    break
+                else:
+                    raise RuntimeError(
+                        f"SDK stream idle {IDLE_NORMAL_S}s with no ResultMessage "
+                        f"— genuine hang, bailing"
+                    )
             if not isinstance(message, (AssistantMessage, ResultMessage)):
                 continue
             if isinstance(message, AssistantMessage):
@@ -1010,6 +1220,7 @@ async def run_cron(task_name: str):
                 if message.total_cost_usd:
                     total_cost = message.total_cost_usd
                     log_lines.append(f"\n---\nCost: ${message.total_cost_usd:.4f}\n")
+                saw_result = True
                 _flush_log()
     except Exception as e:
         import traceback
@@ -1019,6 +1230,26 @@ async def run_cron(task_name: str):
         filter_hit = any(
             "Output blocked by content filtering policy" in t for t in text_blocks
         )
+        # Detect the SDK initialize control-request timeout — this is a
+        # different failure class than a mid-work crash. The SDK couldn't
+        # even complete its handshake with the CLI subprocess. Pattern:
+        #   "Control request timeout: initialize" + total_turns == 0
+        # Caused the 06-24 12h blackout (sustained, 18 runs at 600s) and the
+        # 06-25 17:44 singleton (123s — SDK's own internal timeout). Yesterday's
+        # ward-no-cli classified the CLI-missing case; this classifies the
+        # CLI-present-but-handshake-failed case. Same visibility discipline.
+        init_stall_hit = (
+            total_turns == 0
+            and "Control request timeout" in str(e)
+            and "initialize" in str(e)
+        )
+        # Detect OAuth/auth expiry — the CLI prints "Failed to authenticate: ..."
+        # into the message stream, then dies exit-1. Distinct class because it is
+        # uniquely OPERATOR-actionable: no retry fixes it, only an interactive
+        # `claude /login`. The 07-20 22:44 → 07-21 01:00 blackout killed 5 runs
+        # that all read as generic exit-1 in the ledger. Same visibility
+        # discipline as init_stall (06-26) / ward-no-cli (06-25).
+        auth_fail_hit = any("Failed to authenticate" in t for t in text_blocks)
         if filter_hit:
             crashed_with = "content_filter_blocked"
             log_lines.append(
@@ -1027,22 +1258,107 @@ async def run_cron(task_name: str):
                 "work completed before the block is preserved above.\n"
             )
             print(f"[cron] {task_name} filter-blocked after {total_turns} turns", flush=True)
+        elif auth_fail_hit:
+            auth_line = next(
+                (t.strip() for t in text_blocks if "Failed to authenticate" in t),
+                "Failed to authenticate",
+            )
+            crashed_with = f"oauth_auth_fail: {auth_line[:200]}"
+            log_lines.append(
+                f"\n---\nAUTH-FAIL: {auth_line}\n"
+                f"The CLI's OAuth session is expired/unrefreshable. Retries will "
+                f"NOT fix this — the operator must run `claude /login` in an "
+                f"interactive session. Ledger event class: auth_fail.\n"
+            )
+            print(f"[cron] {task_name} auth_fail: {auth_line}", flush=True)
+            try:
+                now = datetime.now()
+                alert_dir = LOGS_DIR / "alerts"
+                alert_dir.mkdir(parents=True, exist_ok=True)
+                stamp = now.strftime("%Y%m%d_%H%M")
+                (alert_dir / f"{stamp}_oauth_auth_fail_{task_name}.md").write_text(
+                    f"# OAuth auth failure — {task_name}\n\n"
+                    f"Time: {now.isoformat()}\n"
+                    f"Status: P3 (singleton) — watchdog escalates to P2 at "
+                    f"≥3 auth_fail events in 6h\n\n"
+                    f"The claude CLI reported:\n\n> {auth_line}\n\n"
+                    f"This failure class is OPERATOR-ACTIONABLE ONLY: the OAuth "
+                    f"session cannot self-heal from cron. If sustained, every "
+                    f"scheduled run dies at ~2s / 0 turns until Sequoyah runs "
+                    f"`claude /login` interactively.\n\n"
+                    f"Singleton may mean a transient refresh hiccup that "
+                    f"self-recovered (cf. 20260721_0144 blackout, recovered "
+                    f"without intervention). Sustained means the station is "
+                    f"dark.\n",
+                    encoding="utf-8",
+                )
+            except Exception as ae:
+                print(f"[cron] auth-fail alert write failed: {ae}", flush=True)
+        elif init_stall_hit:
+            crashed_with = f"sdk_init_stall: {type(e).__name__}: {e}"
+            log_lines.append(
+                f"\n---\nINIT-STALL: SDK initialize handshake timed out before "
+                f"any work began. Likely a transient claude CLI subprocess "
+                f"stall (AV scan, slow spawn, network glitch on auth check). "
+                f"This is distinct from a mid-work crash — total_turns=0, "
+                f"no ResultMessage seen.\n"
+            )
+            log_lines.append("```\n" + traceback.format_exc() + "\n```\n")
+            print(f"[cron] {task_name} sdk_init_stall (turns=0)", flush=True)
+            # File a distinct alert + give the ledger a separate event class,
+            # matching the ward-no-cli pattern. Watchdog/wake_audit can be
+            # taught to recognize `init_stall` as noise-when-singleton /
+            # signal-when-sustained.
+            try:
+                now = datetime.now()
+                alert_dir = LOGS_DIR / "alerts"
+                alert_dir.mkdir(parents=True, exist_ok=True)
+                stamp = now.strftime("%Y%m%d_%H%M")
+                (alert_dir / f"{stamp}_sdk_init_stall_{task_name}.md").write_text(
+                    f"# SDK init-stall — {task_name}\n\n"
+                    f"Time: {now.isoformat()}\n"
+                    f"Status: P3 (singleton) — escalate to P2 if multiple in 6h\n\n"
+                    f"The claude_agent_sdk control-request handshake "
+                    f"(`_send_control_request: initialize`) timed out before "
+                    f"the first ResultMessage. Zero work performed.\n\n"
+                    f"This is a distinct failure class from a mid-work crash. "
+                    f"Most often transient — next scheduled run typically "
+                    f"succeeds. If sustained across multiple runs, the host "
+                    f"is in a degraded state (AV scan, CLI subprocess wedged, "
+                    f"auth flow blocked).\n\n"
+                    f"Trace excerpt:\n```\n{crashed_with}\n```\n",
+                    encoding="utf-8",
+                )
+            except Exception as ae:
+                print(f"[cron] init-stall alert write failed: {ae}", flush=True)
         else:
             crashed_with = f"{type(e).__name__}: {e}"
             log_lines.append(f"\n---\nCRASH: {crashed_with}\n")
             log_lines.append("```\n" + traceback.format_exc() + "\n```\n")
             print(f"[cron] {task_name} crashed: {crashed_with}", flush=True)
+    finally:
+        # Always release the SDK generator so background pipes/subprocesses
+        # don't dangle after a watchdog finalize or a crash. aclose() is
+        # idempotent and safe even if the generator already exhausted.
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
 
     elapsed = asyncio.get_event_loop().time() - start_time
     if crashed_with == "content_filter_blocked":
         final_status = "filter_blocked"
+    elif crashed_with and crashed_with.startswith("sdk_init_stall"):
+        final_status = "init_stall"
+    elif crashed_with and crashed_with.startswith("oauth_auth_fail"):
+        final_status = "auth_fail"
     elif crashed_with:
         final_status = "crashed"
     else:
         final_status = "complete"
     _finalize_log(final_status, f"Elapsed: {elapsed:.1f}s · Turns: {total_turns} · Cost: ${total_cost:.4f}")
     _append_cron_tail(task_name, started_at, final_status, log_file.name,
-                      extra=f"turns={total_turns} cost=${total_cost:.4f} {elapsed:.0f}s")
+                      extra=f"model={model_display} turns={total_turns} cost=${total_cost:.4f} {elapsed:.0f}s")
 
     print(f"Cron task '{task_name}' {final_status}. Log: {log_file}")
 
@@ -1075,19 +1391,80 @@ async def run_cron(task_name: str):
     )
 
 
+def _atomic_append(path: Path, data: bytes, *, retries: int = 20, retry_delay: float = 0.05):
+    """Append `data` to `path` atomically across concurrent processes.
+
+    Python's default buffered `open("a")` on Windows does NOT guarantee
+    atomicity between processes: when two crons fire in the same second
+    (heartbeat + systems_check + threads_engage, common on the :44 mark)
+    their appends can interleave and split a single line like
+    `cron_heartbeat_YYYYMMDD_HHMMSS.md\\n` into two writes, leaving a stray
+    `md` on its own line. 29 such collisions live in cron.log today; this
+    is the same failure class as alert 20260702_0144 (concurrent DLL init).
+
+    Fix: use OS-level file locking around the write. msvcrt.locking on
+    Windows, fcntl.flock on POSIX. Retry a bounded number of times on
+    contention so a busy tick doesn't drop a ledger line silently.
+    """
+    import errno
+    import time
+    is_windows = os.name == "nt"
+    # Ensure file exists so we can lock it (msvcrt.locking requires >=1 byte
+    # region — we lock a byte at offset 0 regardless of write position).
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        # Acquire exclusive lock
+        for attempt in range(retries):
+            try:
+                if is_windows:
+                    import msvcrt
+                    # Lock byte 0. LK_LOCK blocks up to ~10s internally then raises.
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                break
+            except OSError as e:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(retry_delay)
+        try:
+            # O_APPEND guarantees the write goes to end regardless of lseek above
+            os.write(fd, data)
+        finally:
+            try:
+                if is_windows:
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass  # unlock failure is non-fatal; close will drop it
+    finally:
+        os.close(fd)
+
+
 def _append_cron_tail(task_name: str, started_at: datetime, status: str,
                       log_name: str, extra: str = ""):
     """Append one line to ~/.count/logs/cron.log — the rolling ledger of
     every cron invocation. This is what cron_orientation_preamble() reads
     so each fresh agent can see what recently ran without scavenging the
-    filesystem."""
+    filesystem.
+
+    Uses `_atomic_append` so concurrent cron fires (common on :44) cannot
+    interleave writes and leave stray `md` fragments — see the docstring
+    on `_atomic_append` for the failure class this closes.
+    """
     try:
         tail_file = LOGS_DIR / "cron.log"
         ts = started_at.strftime("%Y-%m-%d %H:%M:%S")
         suffix = f" {extra}" if extra else ""
         line = f"[{ts}] {task_name:<20s} {status:<10s} {log_name}{suffix}\n"
-        with tail_file.open("a", encoding="utf-8") as f:
-            f.write(line)
+        _atomic_append(tail_file, line.encode("utf-8"))
     except Exception as e:
         print(f"[cron] tail append failed: {e}", flush=True)
 
@@ -1338,6 +1715,7 @@ async def run_telegram():
     PID lockfile prevents zombie processes. Gateway-level commands (/reset,
     /status, /cost, /ping) are handled without invoking The Count.
     """
+    _assert_claude_cli_available("telegram")
     import httpx
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -1408,6 +1786,12 @@ async def run_telegram():
                 {"command": "cron", "description": "List cron tasks and schedule"},
                 {"command": "honcho", "description": "Vector memory status"},
                 {"command": "ping", "description": "Health check"},
+                {"command": "budget", "description": "Station cost summary (today + month)"},
+                {"command": "queue", "description": "Patreon outbox status"},
+                {"command": "heartbeat", "description": "Recent heartbeat moves"},
+                {"command": "surfaces", "description": "Posting surface health"},
+                {"command": "overview", "description": "Compact station overview"},
+                {"command": "alerts", "description": "Open station alerts"},
             ]})
             print("  Commands registered with Telegram")
         except Exception as e:
@@ -1579,6 +1963,175 @@ async def run_telegram():
                 await tg_send(http, token, chat_id, honcho.status())
                 return True
 
+            # --- Station status commands (via tools/station_status.py) ---
+            station_cmds = {
+                "/budget": "budget",
+                "/queue": "queue",
+                "/heartbeat": "heartbeat",
+                "/surfaces": "surfaces",
+                "/overview": "overview",
+                "/alerts": "alerts",
+            }
+            if c in station_cmds:
+                subcmd = station_cmds[c]
+                script = str(COUNT_HOME / "tools" / "station_status.py")
+                cmd_args = [sys.executable, script, subcmd]
+                # /heartbeat supports optional count: /heartbeat 20
+                if subcmd == "heartbeat" and arg:
+                    try:
+                        n = int(arg)
+                        cmd_args.extend(["--n", str(n)])
+                    except ValueError:
+                        pass
+                try:
+                    result = subprocess.run(
+                        cmd_args, capture_output=True, text=True, timeout=15,
+                    )
+                    output = result.stdout.strip() or "(no output)"
+                except subprocess.TimeoutExpired:
+                    output = f"⚠ {subcmd} timed out"
+                except Exception as e:
+                    output = f"⚠ {subcmd} error: {e}"
+                await tg_send(http, token, chat_id, output)
+                print(f"  [station/{subcmd}]")
+                return True
+
+            # --- Approval queue commands ---
+            if c == "/approve":
+                aq_script = str(COUNT_HOME / "tools" / "approval_queue.py")
+                if not arg:
+                    # No arg: show pending items
+                    try:
+                        # Import format function directly
+                        import importlib.util
+                        spec = importlib.util.spec_from_file_location("approval_queue", aq_script)
+                        aq = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(aq)
+                        output = aq.format_pending_summary()
+                    except Exception as e:
+                        output = f"⚠ approval_queue error: {e}"
+                else:
+                    item_id = arg.strip().split()[0]
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, aq_script, "approve", item_id],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        output = result.stdout.strip() or result.stderr.strip() or "(no output)"
+                    except Exception as e:
+                        output = f"⚠ approve error: {e}"
+                await tg_send(http, token, chat_id, output)
+                print(f"  [approve {arg or '(list)'}]")
+                return True
+
+            if c == "/reject":
+                aq_script = str(COUNT_HOME / "tools" / "approval_queue.py")
+                if not arg:
+                    await tg_send(http, token, chat_id, "Usage: /reject <id> [reason]")
+                    return True
+                reject_parts = arg.strip().split(maxsplit=1)
+                item_id = reject_parts[0]
+                reason = reject_parts[1] if len(reject_parts) > 1 else ""
+                cmd_args = [sys.executable, aq_script, "reject", item_id]
+                if reason:
+                    cmd_args.extend(["--reason", reason])
+                try:
+                    result = subprocess.run(
+                        cmd_args, capture_output=True, text=True, timeout=30,
+                    )
+                    output = result.stdout.strip() or result.stderr.strip() or "(no output)"
+                except Exception as e:
+                    output = f"⚠ reject error: {e}"
+                await tg_send(http, token, chat_id, output)
+                print(f"  [reject {item_id}]")
+                return True
+
+            if c == "/kill":
+                if not arg:
+                    await tg_send(http, token, chat_id, "Usage: /kill <task_name>\nStops a running scheduled task.")
+                    return True
+                task_name = arg.strip()
+                tn = f"Count_{task_name}" if not task_name.startswith("Count_") else task_name
+                try:
+                    result = subprocess.run(
+                        ["cmd", "/c", f"schtasks /end /tn {tn}"],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    output = result.stdout.strip() or result.stderr.strip() or f"Sent stop to {tn}"
+                except Exception as e:
+                    output = f"⚠ kill error: {e}"
+                await tg_send(http, token, chat_id, output)
+                print(f"  [kill {tn}]")
+                return True
+
+            # --- Kill-switch commands (one-tap posting pause) ---
+            # /sleep [surface] [reason]  — pause. No args = pause all.
+            # /wake  [surface]           — resume. No args = resume all.
+            # /paused                    — current pause state.
+            _kill_surfaces = {"all", "bluesky", "instagram", "pissmissle", "site", "threads"}
+            kill_script = str(COUNT_HOME / "tools" / "pause_posting.py")
+
+            if c == "/sleep":
+                surface = "all"
+                reason = ""
+                if arg:
+                    parts = arg.strip().split(maxsplit=1)
+                    if parts and parts[0].lower() in _kill_surfaces:
+                        surface = parts[0].lower()
+                        reason = parts[1] if len(parts) > 1 else ""
+                    else:
+                        reason = arg.strip()
+                cmd_args = [
+                    sys.executable, kill_script, "pause",
+                    "--surface", surface, "--by", "operator",
+                ]
+                if reason:
+                    cmd_args.extend(["--reason", reason])
+                try:
+                    result = subprocess.run(
+                        cmd_args, capture_output=True, text=True, timeout=15,
+                    )
+                    output = result.stdout.strip() or result.stderr.strip() or f"Paused {surface}."
+                except Exception as e:
+                    output = f"⚠ sleep error: {e}"
+                await tg_send(http, token, chat_id, output)
+                print(f"  [sleep surface={surface} reason={reason!r}]")
+                return True
+
+            if c == "/wake":
+                surface = "all"
+                if arg:
+                    first = arg.strip().split()[0].lower()
+                    if first in _kill_surfaces:
+                        surface = first
+                cmd_args = [
+                    sys.executable, kill_script, "resume",
+                    "--surface", surface, "--by", "operator",
+                ]
+                try:
+                    result = subprocess.run(
+                        cmd_args, capture_output=True, text=True, timeout=15,
+                    )
+                    output = result.stdout.strip() or result.stderr.strip() or f"Resumed {surface}."
+                except Exception as e:
+                    output = f"⚠ wake error: {e}"
+                await tg_send(http, token, chat_id, output)
+                print(f"  [wake surface={surface}]")
+                return True
+
+            if c == "/paused":
+                try:
+                    result = subprocess.run(
+                        [sys.executable, kill_script, "status"],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    output = result.stdout.strip() or "(no output)"
+                except Exception as e:
+                    output = f"⚠ paused error: {e}"
+                await tg_send(http, token, chat_id, output)
+                print("  [paused]")
+                return True
+
             return False
 
         async def dispatch():
@@ -1667,11 +2220,23 @@ async def run_telegram():
                 max_turns=90,
                 model=current_model,
                 setting_sources=[],
+                cli_path=CLAUDE_CLI_PATH,
+                max_buffer_size=SDK_MAX_BUFFER_SIZE,
             )
 
             if session_id:
                 opts.resume = session_id
             else:
+                # Rebuild the prompt file fresh for each NEW session — a
+                # long-running daemon otherwise hands new sessions a schema
+                # snapshot and a "Today is..." date frozen at daemon boot
+                # (observed 2026-07-22: session booted with a weeks-stale
+                # dg-session-orient copy). Resume path untouched: a resumed
+                # session keeps its birth prompt by SDK design.
+                try:
+                    orchestrator_prompt_file = write_system_prompt_file("telegram")
+                except Exception as e:
+                    print(f"  !! prompt rebuild failed ({e}); using previous prompt file")
                 opts.extra_args = {"system-prompt-file": str(orchestrator_prompt_file)}
                 # Inject recent conversation context so the orchestrator isn't blind
                 # after a session reset or error
@@ -2038,7 +2603,7 @@ def main():
         print()
         print("Telegram gateway commands (sent in chat):")
         print("  /stop                     — interrupt, cancel running dispatch")
-        print("  /model [opus|sonnet|haiku] — view or switch model")
+        print("  /model [fable|opus|sonnet|haiku] — view or switch model")
         print("  /title <name>             — save current session")
         print("  /resume [name]            — resume saved session (no arg = list)")
         print("  /compact                  — squash context, fresh session")
